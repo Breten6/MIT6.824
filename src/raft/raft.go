@@ -114,8 +114,8 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	return term, isleader
 }
-func (log *Log) getLastLog() LogEntry {
-	return log.entries[len(log.entries)-1]
+func (log *Log) getLastLog() *LogEntry {
+	return &log.entries[len(log.entries)-1]
 }
 func (rf *Raft) findLastLogInTerm(x int) int {
 	for i := rf.log.getLastLog().Index; i > 0; i-- {
@@ -184,6 +184,14 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.voteFor = voteFor
 		rf.log = logs
+	}
+}
+func (rf *Raft) setTerm(term int) {
+	if term > rf.currentTerm || rf.currentTerm == 0 {
+		rf.curStatus = 1
+		rf.currentTerm = term
+		rf.voteFor = -1
+		rf.persist()
 	}
 }
 
@@ -390,6 +398,7 @@ func (rf *Raft) election() {
 	rf.curStatus = 2
 	rf.currentTerm++
 	rf.voteFor = rf.me
+	rf.persist()
 	voted := 1
 	for i := range rf.peers {
 		if i == rf.me {
@@ -407,12 +416,22 @@ func (rf *Raft) election() {
 			if rf.sendRequestVote(i, &args, &reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-
+				if reply.Term > args.Term {
+					rf.setTerm(reply.Term)
+					return
+				}
+				if reply.Term < args.Term || !reply.VoteGranted {
+					return
+				}
 				if reply.Term == rf.currentTerm {
 					if reply.VoteGranted {
 						voted++
 						if voted > len(rf.peers)/2 {
 							rf.curStatus = 3
+							for j := range rf.peers {
+								rf.nextIndex[j] = rf.log.getLastLog().Index + 1
+								rf.matchIndex[j] = 0
+							}
 							rf.Appending(true)
 						}
 					} else if reply.Term > rf.currentTerm {
@@ -435,6 +454,12 @@ func (rf *Raft) Appending(heartbeat bool) {
 		}
 
 		if rf.log.getLastLog().Index >= nextIndex || heartbeat {
+			if nextIndex > rf.log.getLastLog().Index+1 {
+				nextIndex = rf.log.getLastLog().Index
+			}
+			if nextIndex <= 0 {
+				nextIndex = 1
+			}
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -452,6 +477,10 @@ func (rf *Raft) Appending(heartbeat bool) {
 				}
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				if reply.Term > rf.currentTerm {
+					rf.setTerm(reply.Term)
+					return
+				}
 				if reply.Success {
 					matchIndex := args.PrevLogIndex + len(args.Entries)
 					if matchIndex > rf.matchIndex[i] {
@@ -474,7 +503,7 @@ func (rf *Raft) Appending(heartbeat bool) {
 				} else if rf.nextIndex[i] > 1 {
 					rf.nextIndex[i]--
 				}
-				rf.leaderCommitRule()
+				rf.leaderCommit()
 			}(args, i)
 		}
 
@@ -514,12 +543,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	for idx, entry := range args.Entries {
-		// append entries rpc 3
 		if entry.Index <= rf.log.getLastLog().Index && rf.log.entries[entry.Index].Term != entry.Term {
 			rf.log.entries = rf.log.entries[:entry.Index]
 			rf.persist()
 		}
-		// append entries rpc 4
 		if entry.Index > rf.log.getLastLog().Index {
 			rf.log.entries = append(rf.log.entries, args.Entries[idx:]...)
 			rf.persist()
@@ -539,8 +566,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 }
-func (rf *Raft) leaderCommitRule() {
-	// leader rule 4
+func (rf *Raft) leaderCommit() {
 	if rf.curStatus != 3 {
 		return
 	}
